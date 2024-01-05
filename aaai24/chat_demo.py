@@ -13,6 +13,7 @@ from loguru import logger
 import multiprocessing
 from typing import List, Optional, Tuple
 from openai import OpenAI
+from transformers import AutoTokenizer, AutoModel
 
 # openai.api_key = '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'
 multiprocessing.set_start_method('spawn', force=True)
@@ -36,7 +37,7 @@ model_name2url = {
 #     return generated_text
 
 def chat_with_gpt(prompt):
-    client = OpenAI(api_key = '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')
+    client = OpenAI(api_key = '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')
     response = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
@@ -70,6 +71,8 @@ def run(rank, config, task_map, wiki_retriever, gen_retriever, summarizer, contr
         LLM.ddp = config["ddp"]
 
         LLM.initial_all(gpu, config["LLMMap"][gpu])
+
+        # logger.info(f"\nllm:\n{LLM.llms}")
 
         if rank == 0:
             wiki_retriever.initialize()
@@ -136,6 +139,7 @@ def build_demo(config, debug=False):
 
     # demo executor
     def demo_query(query, language, history: Optional[List[Tuple[str, str]]] = None):
+        raw_query = query
         if history is None:
             history = []
         try:
@@ -145,13 +149,26 @@ def build_demo(config, debug=False):
             if history != []:
                 sentence = ''
                 for q, response in history:
-                    # sentence = sentence + q + '\n' + response + '\n'
-                    sentence = sentence + '用户：' + q + '\n' + '助手：' +response + '\n'
-                query = sentence + '用户：' + query + '\n' + '请根据以上对话重写最后一个问题用于检索，回复的开头不要有助手：或用户：'
+                    sentence = sentence + '用户：' + q + '\n' + '助手：' + response 
+                # query = sentence + '用户：' + query + '\n' + '请根据以上对话重写最后一个问题用于检索，回复的开头不要有助手：或用户：'
+                # print('--------------------------------------------query for rewriter-----------------------------')
+                # print(query)
+                # try:
+                #     query = chat_with_gpt(query)
+                #     print(query)
+                # except Exception as e:
+                #     print(f"An error occurred when rewrite: {e}")
+                query = "如下是一段示例：\n\n\n用户：今天几号\n助手：今天是2023年12月19日。\n用户：明天呢\n 请根据以上对话将最后一个问题重写为清晰、简洁的搜索查询格式\n回答：明天是几号?\n\n\n" + sentence + '用户：' + query + '\n' + '请根据以上对话将最后一个问题重写为清晰、简洁的搜索查询格式\n回答：'
                 print('--------------------------------------------query for rewriter-----------------------------')
                 print(query)
                 try:
-                    query = chat_with_gpt(query)
+                    # model, tokenizer=LLM.llms["gpu1:chatglm2"]
+                    # logger.info(f"\nllm:\n{LLM.llms}")
+                    tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm2-6b", trust_remote_code=True)
+                    model = AutoModel.from_pretrained("THUDM/chatglm2-6b", trust_remote_code=True).half().cuda()
+                    model = model.eval()
+                    query, history0 = model.chat(tokenizer, query, history=[])
+                    #query = chat_with_gpt(query)
                     print(query)
                 except Exception as e:
                     print(f"An error occurred when rewrite: {e}")
@@ -171,6 +188,22 @@ def build_demo(config, debug=False):
             _update(task_map, "gpu0", uuid_2, task_item)
 
             web_docs = web_retriever.retrieve(query, language)
+            #处理web检索为空的情况
+            if web_docs == []:
+                uuid_6 = str(uuid4())
+                kwargs = {"queries": [raw_query], "language_list": [language], "knowledge_list": [' '], "query_only": True, "history": history,
+                          "gpu": "gpu1"}
+                task_item = ("response", kwargs, None)
+                _update(task_map, "gpu1", uuid_6, task_item)
+                while task_map["gpu1"][uuid_6][2] is None:
+                    continue
+                response_list = _remove(task_map, "gpu1", uuid_6)[2]
+                answer = response_list[0]
+                logger.info(f"\nquery_only answer:\n{answer}")
+                #直接返回query_only
+                history = history + [(query, answer)]
+                return answer, history
+
 
             kwargs = {"query": query, "language": language, "doc": "\n".join(web_docs), "gpu": "gpu0", "top_k": 10}
             task_item = ("contrive", kwargs, None)
@@ -285,13 +318,13 @@ def build_demo(config, debug=False):
 
 
             uuid_1 = str(uuid4())
-            kwargs = {"queries": [query] * 3, "language_list": [language] * 3, "knowledge_list": doc_list[:3], "query_only": False, "history": history,
+            kwargs = {"queries": [raw_query] * 3, "language_list": [language] * 3, "knowledge_list": doc_list[:3], "query_only": False, "history": history,
                       "gpu": "gpu0"}
             task_item = ("response", kwargs, None)
             _update(task_map, "gpu0", uuid_1, task_item)
 
             uuid_2 = str(uuid4())
-            kwargs = {"queries": [query] * 2, "language_list": [language] * 2, "knowledge_list": doc_list[3:], "query_only": False, "history": history,
+            kwargs = {"queries": [raw_query] * 2, "language_list": [language] * 2, "knowledge_list": doc_list[3:], "query_only": False, "history": history,
                       "gpu": "gpu1"}
             task_item = ("response", kwargs, None)
             _update(task_map, "gpu1", uuid_2, task_item)
@@ -404,7 +437,12 @@ def build_demo(config, debug=False):
             #log final answer
             logger.info(f"\nfinal answer:\n{answer}")
 
+            logger.info(f"\nquery:\n{query}")
+            
+
             history = history + [(query, answer)]
+
+            logger.info(f"\nhistory:\n{history}")
             return answer, history
             
         except:
